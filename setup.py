@@ -124,6 +124,8 @@ ext_modules.append(
             ] + get_features_args() + get_arch_flags() + get_nvcc_thread_args(),
         },
         include_dirs=[
+            # CUDA 13 relocated the CCCL headers (cuda/std/*) under include/cccl.
+            Path(CUDA_HOME) / "include" / "cccl",
             Path(this_dir) / "csrc",
             Path(this_dir) / "csrc" / "kerutils" / "include",   # TODO Remove me
             Path(this_dir) / "csrc" / "sm90",
