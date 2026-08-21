@@ -211,6 +211,34 @@ def flash_mla_sparse_fwd(
     return results
 
 
+def flash_mla_sparse_fwd_out(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    *,
+    out: torch.Tensor,
+    max_logits: torch.Tensor,
+    lse: torch.Tensor,
+) -> None:
+    """Run sparse prefill directly into caller-owned output tensors."""
+    flash_mla_cuda.sparse_prefill_fwd_out(
+        q,
+        kv,
+        indices,
+        sm_scale,
+        d_v,
+        attn_sink,
+        topk_length,
+        out,
+        max_logits,
+        lse,
+    )
+
+
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,

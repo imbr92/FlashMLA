@@ -98,14 +98,17 @@ protected:
     }
 };
 
-static std::vector<at::Tensor> sparse_attn_prefill_interface(
+static std::vector<at::Tensor> sparse_attn_prefill_impl(
     const at::Tensor &q,
     const at::Tensor &kv,
     const at::Tensor &indices,
     float sm_scale,
     int d_v,
     const std::optional<at::Tensor> &attn_sink,
-    const std::optional<at::Tensor> &topk_length
+    const std::optional<at::Tensor> &topk_length,
+    const std::optional<at::Tensor> &out_opt,
+    const std::optional<at::Tensor> &max_logits_opt,
+    const std::optional<at::Tensor> &lse_opt
 ) {
     using bf16 = cutlass::bfloat16_t;
     
@@ -155,16 +158,46 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     KU_CHECK_LAST_DIM_CONTIGUOUS(attn_sink);
     KU_CHECK_LAST_DIM_CONTIGUOUS(topk_length);
     
-    // Allocate results and buffers
+    // Use caller-owned results when supplied; otherwise preserve the allocating API.
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
     auto opts = q.options();
-    
-    at::Tensor out = torch::empty({s_q, h_q, d_v}, opts);
-    at::Tensor lse = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
-    at::Tensor max_logits = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+
+    at::Tensor out = out_opt.has_value()
+        ? *out_opt
+        : torch::empty({s_q, h_q, d_v}, opts);
+    at::Tensor max_logits = max_logits_opt.has_value()
+        ? *max_logits_opt
+        : torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+    at::Tensor lse = lse_opt.has_value()
+        ? *lse_opt
+        : torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+
+    KU_CHECK_NDIM(out, 3);
+    KU_CHECK_NDIM(max_logits, 2);
+    KU_CHECK_NDIM(lse, 2);
+    KU_CHECK_DEVICE(out);
+    KU_CHECK_DEVICE(max_logits);
+    KU_CHECK_DEVICE(lse);
+    KU_CHECK_DTYPE(out, torch::kBFloat16);
+    KU_CHECK_DTYPE(max_logits, torch::kFloat32);
+    KU_CHECK_DTYPE(lse, torch::kFloat32);
+    KU_CHECK_SHAPE(out, s_q, h_q, d_v);
+    KU_CHECK_SHAPE(max_logits, s_q, h_q);
+    KU_CHECK_SHAPE(lse, s_q, h_q);
     KU_CHECK_CONTIGUOUS(out);
-    KU_CHECK_CONTIGUOUS(lse);
     KU_CHECK_CONTIGUOUS(max_logits);
+    KU_CHECK_CONTIGUOUS(lse);
+    TORCH_CHECK(
+        out.get_device() == q.get_device(),
+        "out must be on the same CUDA device as q"
+    );
+    TORCH_CHECK(
+        max_logits.get_device() == q.get_device(),
+        "max_logits must be on the same CUDA device as q"
+    );
+    TORCH_CHECK(
+        lse.get_device() == q.get_device(), "lse must be on the same CUDA device as q"
+    );
 
     SparseAttnFwdParams params = {
         s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
@@ -240,4 +273,37 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     }
 
     return {out, max_logits, lse};
+}
+
+static std::vector<at::Tensor> sparse_attn_prefill_interface(
+    const at::Tensor &q,
+    const at::Tensor &kv,
+    const at::Tensor &indices,
+    float sm_scale,
+    int d_v,
+    const std::optional<at::Tensor> &attn_sink,
+    const std::optional<at::Tensor> &topk_length
+) {
+    return sparse_attn_prefill_impl(
+        q, kv, indices, sm_scale, d_v, attn_sink, topk_length,
+        std::nullopt, std::nullopt, std::nullopt
+    );
+}
+
+static void sparse_attn_prefill_out_interface(
+    const at::Tensor &q,
+    const at::Tensor &kv,
+    const at::Tensor &indices,
+    float sm_scale,
+    int d_v,
+    const std::optional<at::Tensor> &attn_sink,
+    const std::optional<at::Tensor> &topk_length,
+    const at::Tensor &out,
+    const at::Tensor &max_logits,
+    const at::Tensor &lse
+) {
+    (void)sparse_attn_prefill_impl(
+        q, kv, indices, sm_scale, d_v, attn_sink, topk_length,
+        out, max_logits, lse
+    );
 }
