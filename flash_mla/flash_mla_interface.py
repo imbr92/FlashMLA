@@ -461,3 +461,120 @@ def flash_attn_varlen_kvpacked_func(
         cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
         causal, softmax_scale, is_varlen,
     )
+
+
+def get_sm100_dense_decode_workspace_size(
+    max_seqlen: int,
+    batch_size: int,
+    sm_count: int = 0,
+    num_kv_splits: int = 1,
+) -> int:
+    """Return the caller-owned workspace size for SM100 dense MLA decode."""
+    assert max_seqlen > 0
+    assert batch_size > 0
+    assert sm_count >= 0
+    assert num_kv_splits == -1 or num_kv_splits > 0
+    return flash_mla_cuda.dense_decode_sm100_workspace_size(
+        max_seqlen, batch_size, sm_count, num_kv_splits
+    )
+
+
+def flash_mla_dense_decode_sm100_out(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    block_table: torch.Tensor,
+    workspace: torch.Tensor,
+    softmax_scale: float,
+    *,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    num_kv_splits: int = 1,
+) -> None:
+    """Run Blackwell paged dense MLA into caller-owned output and workspace.
+
+    ``q_nope`` and ``out`` use the CUTLASS kernel's fixed 128-head tile. The
+    query shapes are ``[batch, 128, 512]`` and ``[batch, 128, 64]``; KV cache
+    is ``[pages, page_size, 576]``. This allocation-free entry point is the one
+    intended for CUDA graphs.
+    """
+    flash_mla_cuda.dense_decode_sm100_fwd_out(
+        out,
+        lse,
+        q_nope,
+        q_pe,
+        kv_cache,
+        cache_seqlens,
+        block_table,
+        workspace,
+        softmax_scale,
+        num_kv_splits,
+    )
+
+
+def flash_mla_dense_decode_sm100(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    block_table: torch.Tensor,
+    softmax_scale: float,
+    num_kv_splits: int = 1,
+) -> torch.Tensor:
+    """Convenience wrapper for Blackwell paged dense MLA decode.
+
+    The public query shapes are ``[batch, heads, 512]`` and
+    ``[batch, heads, 64]`` with at most 128 heads. The wrapper pads the head
+    tile, allocates output/workspace, and returns ``[batch, heads, 512]``.
+    Use :func:`flash_mla_dense_decode_sm100_out` on performance-sensitive or
+    CUDA-graph paths.
+    """
+    assert q_nope.ndim == 3 and q_pe.ndim == 3
+    batch_size, num_heads, latent_dim = q_nope.shape
+    assert latent_dim == 512
+    assert q_pe.shape == (batch_size, num_heads, 64)
+    assert 0 < num_heads <= 128
+    assert kv_cache.ndim == 3 and kv_cache.shape[2] == 576
+    page_size = kv_cache.shape[1]
+    assert page_size > 0 and page_size <= 128
+    assert page_size & (page_size - 1) == 0
+    assert 128 % page_size == 0
+    assert block_table.shape[0] == batch_size
+    assert block_table.shape[1] % (128 // page_size) == 0
+    assert cache_seqlens.shape == (batch_size,)
+    assert q_nope.dtype in (torch.float16, torch.bfloat16)
+    assert q_nope.dtype == q_pe.dtype == kv_cache.dtype
+    assert cache_seqlens.dtype == torch.int32
+    assert block_table.dtype == torch.int32
+
+    if num_heads < 128:
+        q_nope_padded = q_nope.new_empty((batch_size, 128, 512))
+        q_pe_padded = q_pe.new_empty((batch_size, 128, 64))
+        q_nope_padded[:, :num_heads].copy_(q_nope)
+        q_pe_padded[:, :num_heads].copy_(q_pe)
+    else:
+        q_nope_padded = q_nope
+        q_pe_padded = q_pe
+
+    out = q_nope.new_empty((batch_size, 128, 512))
+    lse = torch.empty((batch_size, 128), dtype=torch.float32, device=q_nope.device)
+    workspace_size = get_sm100_dense_decode_workspace_size(
+        block_table.shape[1] * page_size,
+        batch_size,
+        num_kv_splits=num_kv_splits,
+    )
+    workspace = torch.empty(workspace_size, dtype=torch.uint8, device=q_nope.device)
+    flash_mla_dense_decode_sm100_out(
+        q_nope_padded,
+        q_pe_padded,
+        kv_cache,
+        cache_seqlens,
+        block_table,
+        workspace,
+        softmax_scale,
+        out=out,
+        lse=lse,
+        num_kv_splits=num_kv_splits,
+    )
+    return out[:, :num_heads].contiguous()

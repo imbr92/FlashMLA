@@ -91,6 +91,9 @@ ext_modules.append(
             "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
             "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
 
+            # sm100 dense decode
+            "csrc/sm100/decode/dense/cutlass_mla.cu",
+
             # sm100 sparse prefill
             "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu",
             "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu",
@@ -131,6 +134,8 @@ ext_modules.append(
             Path(this_dir) / "csrc" / "sm90",
             Path(this_dir) / "csrc" / "cutlass" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
+            Path(this_dir) / "csrc" / "cutlass" / "examples" / "77_blackwell_fmha",
+            Path(this_dir) / "csrc" / "cutlass" / "examples" / "common",
         ],
     )
 )
