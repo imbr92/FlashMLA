@@ -1,9 +1,10 @@
-from typing import Optional, Tuple
 import dataclasses
+from typing import Optional, Tuple
 
 import torch
 
 import flash_mla.cuda as flash_mla_cuda
+
 
 @dataclasses.dataclass
 class FlashMLASchedMeta:
@@ -108,7 +109,11 @@ def flash_mla_with_kvcache(
 
     topk = indices_in_kvcache.shape[-1] if indices_in_kvcache is not None else None
     extra_k_page_block_size = extra_k_cache.shape[1] if extra_k_cache is not None else None
-    extra_topk = extra_indices_in_kvcache.shape[-1] if extra_indices_in_kvcache is not None else None
+    extra_topk = (
+        extra_indices_in_kvcache.shape[-1]
+        if extra_indices_in_kvcache is not None
+        else None
+    )
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
@@ -171,6 +176,113 @@ def flash_mla_with_kvcache(
     sched_meta.tile_scheduler_metadata = new_tile_scheduler_metadata
     sched_meta.num_splits = new_num_splits
     return (out, lse)
+
+
+def get_sparse_decode_workspace_size(
+    batch_size: int,
+    query_length: int,
+    num_heads: int,
+    head_dim_qk: int,
+    head_dim_v: int = 512,
+) -> int:
+    """Return the exact byte workspace required by sparse packed-KV decode.
+
+    The size depends on the active GPU's SM count and therefore must be queried
+    in the target device context.  The returned buffer may be reused across
+    calls with the same shape and is written, not read, by the kernels.
+    """
+    return flash_mla_cuda.sparse_decode_fwd_workspace_size(
+        batch_size,
+        query_length,
+        num_heads,
+        head_dim_qk,
+        head_dim_v,
+    )
+
+
+def flash_mla_sparse_decode_fwd_out(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    tile_scheduler_metadata: FlashMLASchedMeta,
+    *,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    workspace: torch.Tensor,
+    head_dim_v: int = 512,
+    softmax_scale: Optional[float] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+) -> None:
+    """Run packed-FP8 sparse decode into caller-owned tensors.
+
+    The first eager call initializes the small scheduler tensors while using
+    the supplied output and accumulation workspace. Thereafter this entry
+    point performs no PyTorch device allocator calls, which makes it suitable
+    for long-lived CUDA graphs. Capturing an uninitialized scheduler is an
+    error: warm it once on an eager stream first.
+
+    ``out`` is ``[b, s_q, h_q, head_dim_v]`` bfloat16 and ``lse`` is the
+    untransposed kernel layout ``[b, s_q, h_q]`` float32. ``workspace`` is a
+    contiguous uint8 tensor with at least
+    :func:`get_sparse_decode_workspace_size` bytes.
+    """
+    sched_meta = tile_scheduler_metadata
+    assert isinstance(sched_meta, FlashMLASchedMeta)
+    topk = indices.shape[-1]
+    extra_page_size = extra_k_cache.shape[1] if extra_k_cache is not None else None
+    extra_topk = extra_indices_in_kvcache.shape[-1] if extra_indices_in_kvcache is not None else None
+    expected = FlashMLASchedMeta.Config(
+        q.shape[0],
+        q.shape[1],
+        q.shape[2],
+        k_cache.shape[1],
+        k_cache.shape[2],
+        False,
+        True,
+        topk,
+        extra_page_size,
+        extra_topk,
+    )
+    if sched_meta.have_initialized:
+        assert sched_meta.config == expected, (
+            "input shape/configuration differs from the warmup that initialized tile_scheduler_metadata"
+        )
+        assert (
+            sched_meta.tile_scheduler_metadata is not None
+            and sched_meta.num_splits is not None
+        )
+    else:
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "tile_scheduler_metadata must be initialized by one eager out call before CUDA graph capture"
+        )
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    new_metadata, new_num_splits = flash_mla_cuda.sparse_decode_fwd_out(
+        out,
+        lse,
+        workspace,
+        q,
+        k_cache,
+        indices,
+        topk_length,
+        attn_sink,
+        sched_meta.tile_scheduler_metadata,
+        sched_meta.num_splits,
+        extra_k_cache,
+        extra_indices_in_kvcache,
+        extra_topk_length,
+        head_dim_v,
+        softmax_scale,
+    )
+    if not sched_meta.have_initialized:
+        sched_meta.config = expected
+        sched_meta.tile_scheduler_metadata = new_metadata
+        sched_meta.num_splits = new_num_splits
+        sched_meta.have_initialized = True
 
 
 def flash_mla_sparse_fwd(

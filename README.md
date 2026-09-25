@@ -136,6 +136,45 @@ The kernel returns `(out, lse)`, where:
 
 See `tests/test_flash_mla_decoding.py` for a complete example.
 
+#### Allocator-free sparse decode
+
+CUDA graphs and long-lived inference runtimes can supply the output, LSE, and
+split-KV accumulation storage explicitly:
+
+```python
+from flash_mla import (
+    flash_mla_sparse_decode_fwd_out,
+    get_mla_metadata,
+    get_sparse_decode_workspace_size,
+)
+
+scheduler, _ = get_mla_metadata()
+workspace = torch.empty(
+    get_sparse_decode_workspace_size(b, s_q, h_q, d_qk, d_v),
+    dtype=torch.uint8,
+    device=q.device,
+)
+out = torch.empty((b, s_q, h_q, d_v), dtype=torch.bfloat16, device=q.device)
+lse = torch.empty((b, s_q, h_q), dtype=torch.float32, device=q.device)
+
+# Initialize the small scheduler tensors once outside capture. The same call is
+# allocator-free after this warmup, provided its shape/configuration is unchanged.
+flash_mla_sparse_decode_fwd_out(
+    q,
+    k_cache,
+    indices,
+    scheduler,
+    out=out,
+    lse=lse,
+    workspace=workspace,
+    topk_length=topk_length,
+)
+```
+
+The workspace size is device-dependent and must be queried with the target CUDA
+device current. See `tests/test_flash_mla_sparse_decode_out.py` for exact output
+parity, bounds-canary, allocator, and CUDA-graph replay checks.
+
 ### Sparse MLA Prefill
 
 For the sparse MLA prefill kernel, call `flash_mla_sparse_fwd` directly with the following parameters:
